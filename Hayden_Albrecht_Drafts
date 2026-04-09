@@ -1,1 +1,79 @@
-//"55 burgers 55 fries 55 tacos 55 pies 55 cokes 100 tater tots 100 pizzas 100 tenders 100 meatballs 100 coffees 55 wings 55 shakes 55 pancakes 55 pastas 55 peppers and 155 taters" -Tim Robinson
+import time
+import sys
+
+import qwiic_keypad
+import qwiic_serlcd
+import qwiic_buzzer
+
+def get_four_keys(keypad, lcd):
+    entered = ""
+    
+    lcd.clearScreen()
+    lcd.setCursor(0,0)
+    lcd.print("Enter 4 keys:")
+    while len(entered) <4:
+        #tells keypad to move the next keypress into its readable register
+        keypad.update_fifo()
+        button = keypad.get_button()
+    
+        if button:
+            char =chr(button)
+            entered+= char
+            print(f"Key pressed: {char}")
+        #show progress on the second LCD line
+        lcd.setCursor(0,1)
+        lcd.print(" " * 16) #clears line
+        lcd.setCursor(0,1)
+        lcd.print(entered)
+        #delay to avoid repeated presses
+        time.sleep(0.25)
+        time.sleep(0.05)
+        return entered
+    def buzz_three_times(buzzer):
+        for _ in range(3):
+            buzzer.on()
+            time.sleep(0.2)
+            buzzer.off()
+            time.sleep(0.2)
+            
+            def main():
+                keypad = qwiic_keypad.QwiicKeypad()
+                lcd = qwiic_serlcd.QwiicSerlcd()
+                buzzer = qwiic_buzzer.QwiicBuzzer()
+                
+                if not keypad.begin():
+                    print("Keypad not detected.", file=sys.stderr)
+                    return
+                if not lcd.connected:
+                    print("LCD not detected.", file=sys.stderr)
+                    return
+                if not buzzer.begin():
+                    print("buzzer not detected.", file=sys.stderr)
+                    return
+                #LCD setup
+                lcd.setBacklight(255,255,255)
+                lcd.setContrast(5)
+                lcd.clearScreen()
+                
+                entered = get_four_keys(keypad, lcd)
+                print(f"4 keys entered: {entered}")
+                lcd.clearScreen()
+                lcd.setCursor(0,0)
+                lcd.print("hello!")
+                lcd.setCursor(0,1)
+                lcd.print("You typed")
+                time.sleep(1.5)
+                lcd.clearScreen()
+                lcd.setCursor(0,0)
+                lcd.print("input")
+                lcd.setCursor(0,1)
+                lcd.print(entered[:16])
+                
+                buzz_three_times(buzzer)
+                
+                
+                if __name__ == "__main__":
+                    try:
+                        main()
+                    except KeyboardInterrupt:
+                        print("\nProgramStopped")
