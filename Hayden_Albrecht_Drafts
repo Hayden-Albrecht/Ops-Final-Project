@@ -2,9 +2,7 @@
 
 import json
 import os
-import sys
 import time
-import traceback
 from typing import Optional, Dict, Any, List
 
 import qwiic_keypad
@@ -14,10 +12,15 @@ import qwiic_buzzer
 
 
 # =========================================================
-# CONFIG
+# FILE PATHS
 # =========================================================
 DATA_FILE = "/home/pi/door_access_users.json"
+LOG_FILE = "/home/pi/door_access_log.txt"
 
+
+# =========================================================
+# TIMEOUTS / TIMING
+# =========================================================
 PASSCODE_TIMEOUT_SECONDS = 20
 RFID_SCAN_TIMEOUT_SECONDS = 15
 MENU_TIMEOUT_SECONDS = 30
@@ -29,10 +32,18 @@ MAIN_LOOP_DELAY = 0.20
 POST_KEY_DELAY = 0.22
 POST_MESSAGE_DELAY = 1.2
 
+
+# =========================================================
+# BACKLIGHT COLORS
+# =========================================================
 DEFAULT_BACKLIGHT = (255, 255, 255)   # white
 GOOD_FLASH = (0, 255, 0)              # green
 BAD_FLASH = (255, 0, 0)               # red
 
+
+# =========================================================
+# ROLES
+# =========================================================
 ROLE_EMPLOYEE = "employee"
 ROLE_MANAGER = "manager"
 ROLE_ADMIN = "admin"
@@ -53,8 +64,8 @@ _last_lcd_time = 0.0
 # =========================================================
 def default_database() -> Dict[str, Any]:
     """
-    First-run seeded users.
-    CHANGE THESE BEFORE REAL USE.
+    First-run seed users.
+    Replace these example RFID values with your real card tags.
     """
     return {
         "users": [
@@ -81,12 +92,43 @@ def default_database() -> Dict[str, Any]:
 
 
 # =========================================================
+# LOGGING
+# =========================================================
+def timestamp_string() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_event(event_type: str, result: str, details: str = "") -> None:
+    """
+    Append a single audit line to the log file.
+    Logging failures are intentionally ignored so they never crash the app.
+    """
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{timestamp_string()} | {result} | {event_type} | {details}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+# =========================================================
 # DATABASE HELPERS
 # =========================================================
+def save_database(db: Dict[str, Any]) -> None:
+    temp_path = DATA_FILE + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, DATA_FILE)
+
+
 def load_database() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         db = default_database()
         save_database(db)
+        log_event("system", "INFO", "created_default_database")
         return db
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -96,15 +138,6 @@ def load_database() -> Dict[str, Any]:
         raise RuntimeError("Invalid database structure")
 
     return db
-
-
-def save_database(db: Dict[str, Any]) -> None:
-    temp_path = DATA_FILE + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(temp_path, DATA_FILE)
 
 
 def normalize_tag(tag: str) -> str:
@@ -119,9 +152,9 @@ def find_user_by_password(db: Dict[str, Any], password: str) -> Optional[Dict[st
 
 
 def find_user_by_rfid(db: Dict[str, Any], rfid: str) -> Optional[Dict[str, Any]]:
-    rfid = normalize_tag(rfid)
+    target = normalize_tag(rfid)
     for user in db["users"]:
-        if user.get("active", True) and normalize_tag(user.get("rfid", "")) == rfid:
+        if user.get("active", True) and normalize_tag(user.get("rfid", "")) == target:
             return user
     return None
 
@@ -139,10 +172,10 @@ def add_user(db: Dict[str, Any], password: str, rfid: str, role: str) -> None:
         raise ValueError("Invalid role")
 
     if find_user_by_password(db, password) is not None:
-        raise ValueError("Password already exists")
+        raise ValueError("Password exists")
 
     if find_user_by_rfid(db, rfid) is not None:
-        raise ValueError("RFID already exists")
+        raise ValueError("RFID exists")
 
     db["users"].append({
         "password": password,
@@ -154,13 +187,13 @@ def add_user(db: Dict[str, Any], password: str, rfid: str, role: str) -> None:
 
 
 def remove_user(db: Dict[str, Any], password: str, rfid: str) -> bool:
-    rfid = normalize_tag(rfid)
+    target_rfid = normalize_tag(rfid)
 
     for user in db["users"]:
         if not user.get("active", True):
             continue
 
-        if user.get("password") == password and normalize_tag(user.get("rfid", "")) == rfid:
+        if user.get("password") == password and normalize_tag(user.get("rfid", "")) == target_rfid:
             if user.get("role") == ROLE_ADMIN and count_active_admins(db) <= 1:
                 raise ValueError("Cannot remove last admin")
 
@@ -348,7 +381,13 @@ def read_keypad_char(keypad) -> Optional[str]:
         return str(button)
 
 
-def get_passcode_from_keypad(lcd, keypad, timeout_s: int, prompt1: str = "Enter passcode", prompt2: str = "then press #") -> Optional[str]:
+def get_passcode_from_keypad(
+    lcd,
+    keypad,
+    timeout_s: int,
+    prompt1: str = "Enter passcode",
+    prompt2: str = "then press #"
+) -> Optional[str]:
     entered = ""
     last_masked = None
     start = time.time()
@@ -476,17 +515,20 @@ def login_flow(lcd, keypad, buzzer, db: Dict[str, Any]) -> Optional[Dict[str, An
     if password is None:
         lcd_message(lcd, "Password timed", "out", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("login", "FAIL", "reason=password_timeout")
         return None
 
     user = find_user_by_password(db, password)
     if user is None:
         lcd_message(lcd, "Invalid password", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("login", "FAIL", f"reason=invalid_password password={password}")
         return None
 
     lcd_message(lcd, "Role:", user["role"], 1.0)
     success_beep(buzzer)
     restore_default_backlight(lcd)
+    log_event("login", "SUCCESS", f"password={user['password']} role={user['role']}")
     return user
 
 
@@ -499,11 +541,13 @@ def reauth_password_and_rfid(lcd, keypad, rfid, buzzer, db: Dict[str, Any], expe
     if password is None:
         lcd_message(lcd, "Password timed", "out", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("reauth", "FAIL", f"user={expected_user['password']} reason=password_timeout")
         return False
 
     if password != expected_user["password"]:
         lcd_message(lcd, "Bad password", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("reauth", "FAIL", f"user={expected_user['password']} reason=bad_password entered={password}")
         return False
 
     tag = wait_for_rfid_scan(
@@ -516,15 +560,18 @@ def reauth_password_and_rfid(lcd, keypad, rfid, buzzer, db: Dict[str, Any], expe
     if tag is None:
         lcd_message(lcd, "RFID timed out", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("reauth", "FAIL", f"user={expected_user['password']} reason=rfid_timeout")
         return False
 
     if normalize_tag(tag) != normalize_tag(expected_user["rfid"]):
         lcd_message(lcd, "Invalid RFID", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("reauth", "FAIL", f"user={expected_user['password']} reason=bad_rfid scanned={normalize_tag(tag)}")
         return False
 
     lcd_message(lcd, "Authorized", "", 0.8)
     success_feedback(lcd, buzzer)
+    log_event("reauth", "SUCCESS", f"user={expected_user['password']} role={expected_user['role']}")
     return True
 
 
@@ -610,15 +657,21 @@ def unlock_flow(lcd, rfid, buzzer, logged_in_user: Dict[str, Any]):
     if tag is None:
         lcd_message(lcd, "No RFID scan", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("unlock", "FAIL", f"user={logged_in_user['password']} role={logged_in_user['role']} reason=rfid_timeout")
         return
 
-    if normalize_tag(tag) == normalize_tag(logged_in_user["rfid"]):
+    scanned = normalize_tag(tag)
+    expected = normalize_tag(logged_in_user["rfid"])
+
+    if scanned == expected:
         lcd_message(lcd, "Unlocked", "", 1.0)
         success_feedback(lcd, buzzer)
+        log_event("unlock", "SUCCESS", f"user={logged_in_user['password']} role={logged_in_user['role']}")
         # Put actual unlock hardware action here
     else:
         lcd_message(lcd, "Invalid RFID", "Access denied", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("unlock", "FAIL", f"user={logged_in_user['password']} role={logged_in_user['role']} reason=bad_rfid scanned={scanned}")
 
 
 def lock_flow(lcd, keypad, buzzer, logged_in_user: Dict[str, Any], db: Dict[str, Any]):
@@ -633,6 +686,7 @@ def lock_flow(lcd, keypad, buzzer, logged_in_user: Dict[str, Any], db: Dict[str,
     if password is None:
         lcd_message(lcd, "Password timed", "out", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("lock", "FAIL", f"user={logged_in_user['password']} role={logged_in_user['role']} reason=password_timeout")
         return
 
     current_user = find_user_by_password(db, password)
@@ -640,16 +694,19 @@ def lock_flow(lcd, keypad, buzzer, logged_in_user: Dict[str, Any], db: Dict[str,
     if current_user is None or current_user["password"] != logged_in_user["password"]:
         lcd_message(lcd, "Invalid password", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("lock", "FAIL", f"user={logged_in_user['password']} role={logged_in_user['role']} reason=bad_password entered={password}")
         return
 
     lcd_message(lcd, "Locked", "", 1.0)
     success_beep(buzzer)
     restore_default_backlight(lcd)
+    log_event("lock", "SUCCESS", f"user={logged_in_user['password']} role={logged_in_user['role']}")
     # Put actual lock hardware action here
 
 
 def add_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_user: Dict[str, Any]):
     if not reauth_password_and_rfid(lcd, keypad, rfid, buzzer, db, logged_in_user):
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=reauth_failed")
         return
 
     if logged_in_user["role"] == ROLE_MANAGER:
@@ -662,6 +719,7 @@ def add_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_user:
         if new_role is None:
             lcd_message(lcd, "Role timeout", "", 1.0)
             failure_feedback(lcd, buzzer)
+            log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=role_timeout")
             return
 
     new_password = get_passcode_from_keypad(
@@ -672,16 +730,19 @@ def add_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_user:
     if not new_password:
         lcd_message(lcd, "Bad password", "entry", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=empty_password")
         return
 
     if len(new_password) < 4:
         lcd_message(lcd, "Pass too short", "min 4 digits", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=password_too_short")
         return
 
     if find_user_by_password(db, new_password) is not None:
         lcd_message(lcd, "Password exists", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=password_exists new_password={new_password}")
         return
 
     new_tag = wait_for_rfid_scan(
@@ -694,29 +755,37 @@ def add_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_user:
     if new_tag is None:
         lcd_message(lcd, "No RFID scan", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=rfid_timeout")
         return
+
+    new_tag = normalize_tag(new_tag)
 
     if find_user_by_rfid(db, new_tag) is not None:
         lcd_message(lcd, "RFID exists", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=rfid_exists new_rfid={new_tag}")
         return
 
     try:
         add_user(db, new_password, new_tag, new_role)
         lcd_message(lcd, "User added", new_role, 1.2)
         success_feedback(lcd, buzzer)
+        log_event("add_user", "SUCCESS", f"by={logged_in_user['password']} by_role={logged_in_user['role']} new_password={new_password} new_rfid={new_tag} new_role={new_role}")
     except Exception as exc:
         lcd_message(lcd, "Add failed", str(exc)[:16], 1.2)
         failure_feedback(lcd, buzzer)
+        log_event("add_user", "FAIL", f"by={logged_in_user['password']} by_role={logged_in_user['role']} reason=exception message={str(exc)}")
 
 
 def remove_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_user: Dict[str, Any]):
     if logged_in_user["role"] != ROLE_ADMIN:
         lcd_message(lcd, "Not allowed", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=not_admin")
         return
 
     if not reauth_password_and_rfid(lcd, keypad, rfid, buzzer, db, logged_in_user):
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=reauth_failed")
         return
 
     remove_password = get_passcode_from_keypad(
@@ -727,6 +796,7 @@ def remove_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_us
     if not remove_password:
         lcd_message(lcd, "Bad password", "entry", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=empty_remove_password")
         return
 
     remove_tag = wait_for_rfid_scan(
@@ -739,22 +809,27 @@ def remove_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_us
     if remove_tag is None:
         lcd_message(lcd, "No RFID scan", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=rfid_timeout")
         return
+
+    remove_tag = normalize_tag(remove_tag)
 
     target = None
     for user in db["users"]:
-        if user.get("active", True) and user["password"] == remove_password and normalize_tag(user["rfid"]) == normalize_tag(remove_tag):
+        if user.get("active", True) and user["password"] == remove_password and normalize_tag(user["rfid"]) == remove_tag:
             target = user
             break
 
     if target is None:
         lcd_message(lcd, "User not found", "", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=user_not_found remove_password={remove_password} remove_rfid={remove_tag}")
         return
 
     if target["password"] == logged_in_user["password"] and normalize_tag(target["rfid"]) == normalize_tag(logged_in_user["rfid"]):
         lcd_message(lcd, "Cannot remove", "current admin", 1.0)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} role={logged_in_user['role']} reason=cannot_remove_self")
         return
 
     try:
@@ -762,12 +837,15 @@ def remove_user_flow(lcd, keypad, rfid, buzzer, db: Dict[str, Any], logged_in_us
         if removed:
             lcd_message(lcd, "User removed", "", 1.0)
             success_feedback(lcd, buzzer)
+            log_event("remove_user", "SUCCESS", f"by={logged_in_user['password']} by_role={logged_in_user['role']} removed_password={remove_password} removed_rfid={remove_tag} removed_role={target['role']}")
         else:
             lcd_message(lcd, "Remove failed", "", 1.0)
             failure_feedback(lcd, buzzer)
+            log_event("remove_user", "FAIL", f"by={logged_in_user['password']} by_role={logged_in_user['role']} reason=remove_returned_false")
     except Exception as exc:
         lcd_message(lcd, "Remove failed", str(exc)[:16], 1.2)
         failure_feedback(lcd, buzzer)
+        log_event("remove_user", "FAIL", f"by={logged_in_user['password']} by_role={logged_in_user['role']} reason=exception message={str(exc)}")
 
 
 # =========================================================
@@ -784,6 +862,7 @@ def run_application():
     flush_keypad(keypad)
     lcd_message(lcd, "System ready", "", 1.0)
     restore_default_backlight(lcd)
+    log_event("system", "INFO", "application_started")
 
     while True:
         db = load_database()
@@ -798,18 +877,23 @@ def run_application():
         if choice is None:
             lcd_message(lcd, "Menu timeout", "", 1.0)
             failure_feedback(lcd, buzzer)
+            log_event("menu", "FAIL", f"user={user['password']} role={user['role']} reason=timeout")
             time.sleep(MAIN_LOOP_DELAY)
             continue
 
         db = load_database()
 
         if choice == "1":
+            log_event("menu", "INFO", f"user={user['password']} role={user['role']} selected=unlock")
             unlock_flow(lcd, rfid, buzzer, user)
         elif choice == "2":
+            log_event("menu", "INFO", f"user={user['password']} role={user['role']} selected=lock")
             lock_flow(lcd, keypad, buzzer, user, db)
         elif choice == "3":
+            log_event("menu", "INFO", f"user={user['password']} role={user['role']} selected=add_user")
             add_user_flow(lcd, keypad, rfid, buzzer, db, user)
         elif choice == "4":
+            log_event("menu", "INFO", f"user={user['password']} role={user['role']} selected=remove_user")
             remove_user_flow(lcd, keypad, rfid, buzzer, db, user)
 
         restore_default_backlight(lcd)
@@ -821,15 +905,27 @@ def run_application():
 # =========================================================
 def main():
     while True:
+        lcd = None
+        buzzer = None
+
         try:
             run_application()
         except KeyboardInterrupt:
             raise
-        except Exception:
+        except Exception as exc:
             try:
-                traceback.print_exc()
+                log_event("system", "CRASH", f"message={str(exc)}")
             except Exception:
                 pass
+
+            try:
+                lcd = init_lcd()
+                buzzer = init_buzzer()
+                lcd_message(lcd, "System error", "Restarting...", 2.0)
+                failure_feedback(lcd, buzzer)
+            except Exception:
+                pass
+
             time.sleep(2.0)
 
 
